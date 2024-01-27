@@ -122,6 +122,59 @@ static const char * const ttl_s[TTL_E_MAX] = {
 static void dynamic_gc_expired(struct vmod_dynamic_director *obj);
 
 /*--------------------------------------------------------------------
+ * indirect vcl references. see vmod_dynamic.h for details
+ *
+ * the names are deliberately stupid
+ */
+
+// not under mutex because it can only be called from CLI context
+static void
+vclrefref_arm(VRT_CTX, struct vmod_dynamic_director *obj, const char *desc)
+{
+	struct vclrefref *vrr;
+
+	CHECK_OBJ_NOTNULL(obj, VMOD_DYNAMIC_DIRECTOR_MAGIC);
+	vrr = obj->vrr;
+	CHECK_OBJ_NOTNULL(vrr, VCLREFREF_MAGIC);
+	AZ(vrr->vclref);
+	vrr->vclref = VRT_VCL_Prevent_Discard(ctx, desc);
+}
+
+static struct vclrefref *
+vclrefref_ref(struct vmod_dynamic_director *obj)
+{
+	struct vclrefref *vrr;
+
+	CHECK_OBJ_NOTNULL(obj, VMOD_DYNAMIC_DIRECTOR_MAGIC);
+	vrr = obj->vrr;
+	CHECK_OBJ_NOTNULL(vrr, VCLREFREF_MAGIC);
+
+	Lck_Lock(&obj->domains_mtx);
+	vrr->refs++;
+	Lck_Unlock(&obj->domains_mtx);
+
+	return (vrr);
+}
+
+// vrrp lol
+static void
+vclrefref_deref(struct vmod_dynamic_director *obj, struct vclrefref **vrrp)
+{
+	struct vclrefref *vrr;
+
+	CHECK_OBJ_NOTNULL(obj, VMOD_DYNAMIC_DIRECTOR_MAGIC);
+	TAKE_OBJ_NOTNULL(vrr, vrrp, VCLREFREF_MAGIC);
+
+	assert(vrr == obj->vrr);
+
+	Lck_Lock(&obj->domains_mtx);
+	assert(vrr->refs > 0);
+	if (--(vrr->refs) == 0 && vrr->vclref != NULL)
+		VRT_VCL_Allow_Discard(&vrr->vclref);
+	Lck_Unlock(&obj->domains_mtx);
+}
+
+/*--------------------------------------------------------------------
  * active domains tree
  */
 
@@ -942,6 +995,7 @@ dynamic_gc_expired(struct vmod_dynamic_director *obj)
 static void
 dynamic_stop(struct vmod_dynamic_director *obj)
 {
+	struct vclrefref *vrr;
 
 	ASSERT_CLI();
 	CHECK_OBJ_NOTNULL(obj, VMOD_DYNAMIC_DIRECTOR_MAGIC);
@@ -950,7 +1004,9 @@ dynamic_stop(struct vmod_dynamic_director *obj)
 
 	dynamic_gc_expired(obj);
 
-	VRT_VCL_Allow_Discard(&obj->vclref);
+	vrr = obj->vrr;
+	vclrefref_deref(obj, &vrr);
+	AZ(vrr);
 }
 
 static void
@@ -960,11 +1016,11 @@ dynamic_start(VRT_CTX, struct vmod_dynamic_director *obj)
 
 	ASSERT_CLI();
 	CHECK_OBJ_NOTNULL(obj, VMOD_DYNAMIC_DIRECTOR_MAGIC);
-	AZ(obj->vclref);
 
 	bprintf(buf, "dynamic director %s", obj->vcl_name);
 	/* name argument is being strdup()ed via REPLACE() */
-	obj->vclref = VRT_VCL_Prevent_Discard(ctx, buf);
+	vclrefref_arm(ctx, obj, buf);
+	AN(vclrefref_ref(obj));
 }
 
 static struct dynamic_domain *
@@ -1083,6 +1139,8 @@ dom_event(VCL_BACKEND dir, enum vcl_event_e ev)
 			break;
 		assert(dom->status == DYNAMIC_ST_READY);
 		dom->status = DYNAMIC_ST_STARTING;
+		AZ(dom->vrr);
+		dom->vrr = vclrefref_ref(dom->obj);
 		AZ(dom->thread);
 		AZ(pthread_create(&dom->thread, NULL, dom_lookup_thread, dom));
 		break;
@@ -1100,6 +1158,8 @@ dom_event(VCL_BACKEND dir, enum vcl_event_e ev)
 
 		AZ(pthread_join(dom->thread, NULL));
 		dom->thread = 0;
+		vclrefref_deref(dom->obj, &dom->vrr);
+		dom->vrr = NULL;
 		assert(dom->status == DYNAMIC_ST_DONE);
 		dom->status = DYNAMIC_ST_READY;
 		break;
@@ -1357,6 +1417,7 @@ vmod_director__init(VRT_CTX,
 	VTAILQ_INIT(&obj->unref_domains);
 	VRBT_INIT(&obj->ref_services);
 	VTAILQ_INIT(&obj->unref_services);
+	INIT_OBJ(obj->vrr, VCLREFREF_MAGIC);
 	REPLACE(obj->vcl_name, vcl_name);
 	REPLACE(obj->port, port);
 	REPLACE(obj->hosthdr, hosthdr);

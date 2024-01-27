@@ -76,6 +76,21 @@ enum dynamic_ttl_e {
 	TTL_E_MAX
 };
 
+/* we take references internally to the one vcl ref taken with the
+ * initial VCL_WARM event.
+ *
+ * references can be taken before the initial VCL_WARM event to support
+ * .resolve() from vcl_init{}
+ */
+
+// protected by obj->mtx
+struct vclrefref {
+	unsigned			magic;
+#define VCLREFREF_MAGIC			0x1d3d97c8
+	unsigned			refs;
+	struct vclref			*vclref;
+};
+
 struct dynamic_domain {
 	unsigned			magic;
 #define DYNAMIC_DOMAIN_MAGIC		0x1bfe1345
@@ -89,6 +104,7 @@ struct dynamic_domain {
 	char				*port;
 	struct vmod_dynamic_director	*obj;
 	pthread_t			thread;
+	struct vclrefref		*vrr;
 	struct lock			mtx;
 	pthread_cond_t			cond;
 	pthread_cond_t			resolve;
@@ -198,7 +214,7 @@ struct vmod_dynamic_director {
 	// only to hold ctx pointer
 	struct vrt_ctx				ctx[1];
 	const char				*vcl_conf;
-	struct vclref				*vclref;
+	struct vclrefref			vrr[1];
 	const struct res_cb			*resolver;
 	struct VPFX(dynamic_resolver)		*resolver_inst;
 	enum dynamic_ttl_e			ttl_from;
